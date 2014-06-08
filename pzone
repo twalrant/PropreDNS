@@ -1,0 +1,168 @@
+#!/bin/bash
+#
+
+force=1
+binddir=./etc/bind
+pzonedir=zones
+
+declare -a supported_records=(A MX TXT)
+
+[ -f "/etc/default/pzone" ] && . /etc/default/pzone
+[ -f "./pzone.defaults" ] && . ./pzone.defaults
+
+## Input: error message
+## Output: none
+## Return: does not, exit with code 1
+function die() {
+    local message=$*
+    local me=$(basename $0)
+    echo -e "[$me]" ${message/\\n/\\n[$me] };
+    exit 1;
+}
+
+## Input: bind zone file
+## Output: serial number
+## Return: true or false if bind file not found
+function serial() {
+    [ -f "$1" ] || return 1;
+    local snum=$(awk '/Serial/ { print $1; }' $1);
+    echo $snum
+    return 0;
+}
+
+## Input: Zone name, Zone admin email {Zone nameserver}
+## Output: none
+## Return: true
+function create_zone() {
+    local admin=$2
+    local nameserver=$3
+    [ -z "$2" ] && die "create_zone():" Missing arguments;
+    [ -f "$binddir/db.$1" ] && die Zone already exist: $binddir/db.$1;
+    [ -d "$pzonedir/$1" ] && die  Zone already exist: $pzonedir/$1;
+    [ -z "$3" ] && nameserver=ns.$1
+    mkdir -p $pzonedir/$1
+    cat >$pzonedir/$1/config <<EOF
+type=master
+ns=$nameserver
+admin=${admin/@/.}
+refresh=$refresh
+retry=$retry
+expire=$expire
+ncachettl=$ncachettl
+EOF
+    date +%Y%m%d01 > $pzonedir/$1/serial
+
+    return 0;
+}
+
+## Input: Zone name
+## Output: none
+## Return: true or false is not present
+function check_zone() {
+    [ -z "$1" ] && die "check_zone():" Missing zone name;
+    [ -d "$pzonedir/$1" ] && return 0; # True
+    return 1; # False
+}
+
+## Input: Record type
+## Output: none
+## Return: true or false is not a supported type
+function check_rectype() {
+    [ -z "$1" ] && die "check_rectype():" Missing type;
+    for item in ${supported_records[*]}; do
+	[ "$item" == "$1" ] && return 0; # True
+    done
+    return 1; # False
+}
+
+## Input: Zone name, record type, record name {, record priority}
+## Output: none
+## Return: true or false if record is not present
+function check_record() {
+    [ -z "$3" ] && die "check_zone():" Missing arguments;
+    check_rectype $2 || die "check_record():" Unsupported record type: $2;
+    check_zone $1 || die "check_record():" Zone not found: $1;
+    local lookup="^$3,"
+    [ -n "$4" ] && lookup="^$3,$4,";
+    grep -qP $lookup $pzonedir/$1/records.$2 && return 0; # True
+    return 1; # False
+}
+
+## Input: Zone name
+## Output: none
+## Return: true or false if record is not present
+function update_serial() {
+    [ -z "$1" ] && die "update_serial():" Missing arguments;
+    check_zone $1 || die "update_serial():" Zone not found: $1;
+
+    local snum0=$(serial "$binddir/db.$1");
+    if [ -n "$snum0" ]; then
+	local snum=$(date +%Y%m%d01)
+	while [ $snum -le $snum0 ]; do snum=$((snum+1)); done
+    else
+	snum=$(date +%Y%m%d01)
+    fi
+    echo $snum > $pzonedir/$1/serial
+}
+
+
+## Input: Zone name, record type, record name, record params
+## Output: none
+## Return: true
+function add_record() {
+    [ -z "$4" ] && die "add_record():" Missing arguments;
+
+    local records=$pzonedir/$1/records.$2
+    [ -f "$records" ] && touch $records;
+
+    check_zone $1 || die "add_record():" Zone not found: $1;
+    check_record $1 $2 $3 && [ ! $force ] && \
+	die "add_record():" Record $2 already exist: $3;
+
+    sed -i "/$3,/d" $records		# Cleanup record, if any.
+    update_serial $1			# Update serial number
+    shift 2;				# Skip zone name and record type
+    echo $* | sed 's/ /,/g' >> $records	# Add record
+
+    return 0;
+}
+
+## Input: Zone name, record name, priority, mail server
+## Output: true
+function add_record_mx() {
+    [ -z "$4" ] && die "add_record():" Missing arguments;
+
+    local records=$pzonedir/$1/records.MX
+    [ -f "$records" ] && touch $records;
+
+    check_zone $1 || die "add_record_mx():" Zone not found: $1;
+    check_record $1 MX $2 $3 && [ ! $force ] && \
+	die "add_record():" Record MX already exist: $2, priority $3;
+
+    # Check assigned mailserver, must exist local or external.
+    if echo $4 | grep -qP "$1$"; then
+	local record=$4
+	check_record $1 A ${record/.$1/} || \
+	    die "Record A not found: "${record/.$1/} "\nPlease define first!"
+    else
+	host $4 >/dev/null || die "Mailserver not found: $4";
+    fi
+
+    sed -i "/^$2,$3,/d" $records	# Cleanup record, if any.
+    update_serial $1			# Update serial number
+    shift;				# Skip zone name
+    echo $* | sed 's/ /,/g' >> $records	# Add MX record
+
+    return 0;
+}
+
+## Main --
+#update_serial example.net
+#serial /etc/bind/db.empty
+#serial /etc/bind/db.local
+#create_zone example.net dns.example.net
+#create_zone test.edu dns.test.org
+add_record example.net A www 10.168.45.67
+add_record_mx example.net mx 50 mx.example.net
+add_record_mx example.net mx 20 mx.yobi.be
+#add_record test.edu MX @ 10 10.23.45.67
