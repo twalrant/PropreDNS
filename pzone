@@ -8,9 +8,11 @@ force=1
 binddir=./etc/bind
 pzonedir=zones
 
+## List of supported records
 declare -a supported_records=(A MX NS CNAME TXT)
 #declare -a supported_functions=(create_zone add_record publish_zone)
 
+## Load defauls
 [ -f "/etc/default/pzone" ] && . /etc/default/pzone
 [ -f "./pzone.defaults" ] && . ./pzone.defaults
 
@@ -18,6 +20,16 @@ declare -a supported_records=(A MX NS CNAME TXT)
 ## Output: none
 ## Return: true
 function warn() {
+    local message=$*
+    local me=$(basename $0)
+    echo -e "[$me]" ${message/\\n/\\n[$me] };
+    return 0;
+}
+
+## Input: verbose message
+## Output: none
+## Return: true
+function verbose() {
     local message=$*
     local me=$(basename $0)
     echo -e "[$me]" ${message/\\n/\\n[$me] };
@@ -82,6 +94,8 @@ ncachettl=$ncachettl
 EOF
     echo "serial="$(date +%Y%m%d01) > $pzonedir/$1/serial
 
+    verbose Zone $1 created.
+
     return 0;
 }
 
@@ -133,61 +147,6 @@ function update_serial() {
 	snum=$(date +%Y%m%d01)
     fi
     echo "serial="$snum > $pzonedir/$1/serial
-}
-
-
-## Input: Zone name, record type, record name, record params
-## Output: none
-## Return: true
-function add_record_old() {
-    [ -z "$4" ] && die "add_record():" Missing arguments;
-
-    local zone=$1
-    check_zone $zone || die "add_record():" Zone not found: $zone;
-
-    local records=$pzonedir/$zone/records.$2
-    [ -f "$records" ] || touch $records;
-
-    check_record $zone $2 $3 && [ ! $force ] && \
-	die "add_record():" Record $2 already exist: $3;
-
-    sed -i "/$3,/d" $records		# Cleanup record, if any.
-    shift 2;				# Skip zone name and record type
-    echo $* | sed 's/ /,/g' >> $records	# Add record
-    update_serial $zone			# Update serial number
-
-    return 0;
-}
-
-## Input: Zone name, record name, priority, mail server
-## Return: true
-function add_record_mx_obsolete() {
-    [ -z "$4" ] && die "add_record():" Missing arguments;
-
-    local zone=$1
-    check_zone $zone || die "add_record_mx():" Zone not found: $zone;
-
-    local records=$pzonedir/$zone/records.MX
-    [ -f "$records" ] || touch $records;
-
-    check_record $zone MX $2 $3 && [ ! $force ] && \
-	die "add_record():" Record MX already exist: $2, priority $3;
-
-    # Check assigned mailserver, must exist local or external.
-    if echo $4 | grep -qP "$zone$"; then
-	local record=$4
-	check_record $zone A ${record/.$zone/} || \
-	    die "Record A not found: "${record/.$zone/} "\nPlease define first!"
-    else
-	host $4 >/dev/null || die "Mailserver not found: $4";
-    fi
-
-    sed -i "/^$2,$3,/d" $records	# Cleanup record, if any.
-    shift;				# Skip zone name
-    echo $* | sed 's/ /,/g' >> $records	# Add MX record
-    update_serial $zone			# Update serial number
-
-    return 0;
 }
 
 ## Input: Zone name, record type, record name, record params...
@@ -366,7 +325,9 @@ EOF
     return 0
 }
 
-##
+## Input: batch file
+## Output: none
+## Return: true
 function pzone_batch() {
     [ -z "$1" ] && die "pzone_batch():" Missing arguments;
     [ -f "$1" ] || die "File not found:" $1
@@ -382,14 +343,12 @@ EOF
     awk -f $awkfile $1 > $batchfile;
     . $batchfile;
     rm -f $batchfile $awkfile;
-}
-
-##
-function get_options() {
     return 0;
 }
 
-##
+## Input: none
+## Output: none
+## Return: Does not returm, exit 1.
 function usage() {
     local me=$(basename $0)
 
@@ -397,11 +356,11 @@ function usage() {
 Usage: $me [<options>] <command> <zonename> [<args>]
 
 Options:
-  -h        - print this help.
-  -t        - Zone Time-To-Live value (default: $(human $ttl)).
-  -r        - Zone refresh value (default: $(human $refresh)).
-  -e        - Zone expire value (default:  $(human $expire)).
-  -n        - Negative cache TTL value (default: $(human $ncachettl)).
+  -h            - print this help.
+  -t TTL        - Zone Time-To-Live value (default: $(human $ttl)).
+  -r REFRESH    - Zone refresh value (default: $(human $refresh)).
+  -e EXPIRE     - Zone expire value (default:  $(human $expire)).
+  -n NCACHETTL  - Negative cache TTL value (default: $(human $ncachettl)).
 
 Commands:
   help          - Display detailed help.
@@ -504,8 +463,25 @@ EOF
     exit;
 }
 
-
-get_options;
+while getopts "ht:r:e:n:" OPTION; do
+    case "$OPTION" in
+	t)	ttl=$OPTARG;
+	    ;;
+	r)	refresh=$OPTARG;
+	    ;;
+	e)	expire=$OPTARG;
+	    ;;
+	n)	ncachettl=$OPTARG;
+	    ;;
+	h)	usage; 
+	    ;;
+	\?)
+	    warn Invalid option: -$OPTARG
+	    usage;
+	    ;;
+    esac
+done
+shift $((OPTIND-1))
 
 [ "$1" == "help" ] && usage help;
 [ -z "$2" ] && usage;
@@ -522,12 +498,14 @@ case $1 in
 	;;
     dis*)
 	warn "Command not supported yet: $1";
+	exit 1;
 	;;
     sho*)
 	shift; show_zone $*;
 	;;
     con*)
 	warn "Command not supported yet: $1";
+	exit 1;
 	;;
     add)
 	shift
@@ -539,35 +517,21 @@ case $1 in
 		shift; add_record $*;
 		;;
 	    *)
-		echo Unsupported add command type: $1
+		warn Unsupported add command type: $1
+		exit 1;
 		;;
 	esac
 	;;
     del)
 	warn "Command not supported yet: $1";
+	exit 1;
 	;;
     bat*)
 	shift; pzone_batch $1;
 	;;
     *)
-	echo Unsupported command: $1
+	warn Unsupported command: $1;
+	exit 1;
 	;;
 esac
-exit
-
-## Main --
-#update_serial example.net
-#serial /etc/bind/db.empty
-#serial /etc/bind/db.local
-#create_zone example.net dns.example.net
-#create_zone test.edu dns.test.org
-add_record example.net A www 10.168.45.67
-add_record example.net A mx 10.168.45.67
-add_record example.net MX mx 50 mx.example.net
-add_record example.net MX mx 20 mx.yobi.be
-add_record example.net CNAME mail mail.yobi.be
-#add_record test.edu MX @ 10 10.23.45.67
-#show_zone example.net
-publish_zone example.net
-
-usage;
+exit 0;
