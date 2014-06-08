@@ -1,22 +1,34 @@
 #!/bin/bash
 #
-
+# PropreDNS - Command line tool for managing DNS zones for BIND.
+#
+# Note: 'Propre' stands for Own in french.
+#
 force=1
 binddir=./etc/bind
 pzonedir=zones
 
-declare -a supported_records=(A MX TXT)
+declare -a supported_records=(A MX NS CNAME TXT)
+#declare -a supported_functions=(create_zone add_record publish_zone)
 
 [ -f "/etc/default/pzone" ] && . /etc/default/pzone
 [ -f "./pzone.defaults" ] && . ./pzone.defaults
+
+## Input: warning message
+## Output: none
+## Return: true
+function warn() {
+    local message=$*
+    local me=$(basename $0)
+    echo -e "[$me]" ${message/\\n/\\n[$me] };
+    return 0;
+}
 
 ## Input: error message
 ## Output: none
 ## Return: does not, exit with code 1
 function die() {
-    local message=$*
-    local me=$(basename $0)
-    echo -e "[$me]" ${message/\\n/\\n[$me] };
+    warn $*;
     exit 1;
 }
 
@@ -27,6 +39,23 @@ function serial() {
     [ -f "$1" ] || return 1;
     local snum=$(awk '/Serial/ { print $1; }' $1);
     echo $snum
+    return 0;
+}
+
+## Input: numbers of seconds.
+## Output: human readable time.
+function human() {
+    local secs=$1;		# 604800
+    local mins=$((secs/60));	# 10080, 0
+    secs=$((secs-60*mins));
+    local hours=$((mins/60));	# 168, 0
+    mins=$((mins-60*hours));
+    local days=$((hours/24));	# 7, 0
+    hours=$((hours-24*days));
+    [ "$days" -gt 0 ] && echo $days"d" && return 0;
+    [ "$hours" -gt 0 ] && echo $hours"h" && return 0;
+    [ "$mins" -gt 0 ] && echo $mins"m" && return 0;
+    echo $secs"s";
     return 0;
 }
 
@@ -45,12 +74,13 @@ function create_zone() {
 type=master
 ns=$nameserver
 admin=${admin/@/.}
+ttl=$ttl
 refresh=$refresh
 retry=$retry
 expire=$expire
 ncachettl=$ncachettl
 EOF
-    date +%Y%m%d01 > $pzonedir/$1/serial
+    echo "serial="$(date +%Y%m%d01) > $pzonedir/$1/serial
 
     return 0;
 }
@@ -102,59 +132,428 @@ function update_serial() {
     else
 	snum=$(date +%Y%m%d01)
     fi
-    echo $snum > $pzonedir/$1/serial
+    echo "serial="$snum > $pzonedir/$1/serial
 }
 
 
 ## Input: Zone name, record type, record name, record params
 ## Output: none
 ## Return: true
-function add_record() {
+function add_record_old() {
     [ -z "$4" ] && die "add_record():" Missing arguments;
 
-    local records=$pzonedir/$1/records.$2
-    [ -f "$records" ] && touch $records;
+    local zone=$1
+    check_zone $zone || die "add_record():" Zone not found: $zone;
 
-    check_zone $1 || die "add_record():" Zone not found: $1;
-    check_record $1 $2 $3 && [ ! $force ] && \
+    local records=$pzonedir/$zone/records.$2
+    [ -f "$records" ] || touch $records;
+
+    check_record $zone $2 $3 && [ ! $force ] && \
 	die "add_record():" Record $2 already exist: $3;
 
     sed -i "/$3,/d" $records		# Cleanup record, if any.
-    update_serial $1			# Update serial number
     shift 2;				# Skip zone name and record type
     echo $* | sed 's/ /,/g' >> $records	# Add record
+    update_serial $zone			# Update serial number
 
     return 0;
 }
 
 ## Input: Zone name, record name, priority, mail server
-## Output: true
-function add_record_mx() {
+## Return: true
+function add_record_mx_obsolete() {
     [ -z "$4" ] && die "add_record():" Missing arguments;
 
-    local records=$pzonedir/$1/records.MX
-    [ -f "$records" ] && touch $records;
+    local zone=$1
+    check_zone $zone || die "add_record_mx():" Zone not found: $zone;
 
-    check_zone $1 || die "add_record_mx():" Zone not found: $1;
-    check_record $1 MX $2 $3 && [ ! $force ] && \
+    local records=$pzonedir/$zone/records.MX
+    [ -f "$records" ] || touch $records;
+
+    check_record $zone MX $2 $3 && [ ! $force ] && \
 	die "add_record():" Record MX already exist: $2, priority $3;
 
     # Check assigned mailserver, must exist local or external.
-    if echo $4 | grep -qP "$1$"; then
+    if echo $4 | grep -qP "$zone$"; then
 	local record=$4
-	check_record $1 A ${record/.$1/} || \
-	    die "Record A not found: "${record/.$1/} "\nPlease define first!"
+	check_record $zone A ${record/.$zone/} || \
+	    die "Record A not found: "${record/.$zone/} "\nPlease define first!"
     else
 	host $4 >/dev/null || die "Mailserver not found: $4";
     fi
 
     sed -i "/^$2,$3,/d" $records	# Cleanup record, if any.
-    update_serial $1			# Update serial number
     shift;				# Skip zone name
     echo $* | sed 's/ /,/g' >> $records	# Add MX record
+    update_serial $zone			# Update serial number
 
     return 0;
 }
+
+## Input: Zone name, record type, record name, record params...
+##        record params=(ALIAS|HOST|IPADDR|(PRIORITY MAILSERVER))
+## Output: none
+## Return: true
+function add_record() {
+    [ -z "$4" ] && die "add_record():" Missing arguments;
+    [ "$2" == "MX" ] && [ -z "$5" ] && die "add_record():" Missing arguments;
+
+    local zone=$1
+    check_zone $zone || die "add_record():" Zone not found: $zone;
+
+    local records=$pzonedir/$zone/records.$2
+    [ -f "$records" ] || touch $records;
+
+    # Special for MX record, handle one extra parameter
+    local priority=
+    local priority_errstr=
+    local lookup=
+    [ "$2" == "MX" ] && \
+	lookup="$4," && \
+	priority=$4 && \
+	priority_errstr=", priority= $4"
+
+    check_record $zone $2 $3 $priority && [ ! $force ] && \
+	die "add_record():" Record $2 already exist: $3$priority_errstr;
+
+    # Check assigned mail or name server, must exist local or external.
+    if [ "$2" == "MX" ] || [ "$2" == "NS" ] || [ "$2" == "CNAME" ]; then
+	local host=$4
+	[ "$2" == "MX" ] && host=$5
+
+	if echo $host | grep -qP "$zone$"; then
+	    check_record $zone A ${host/.$zone/} || \
+		die "Adding record $2, record A not found: "${host/.$zone/} \
+		    "\nPlease define first!"
+	else
+	    host $host >/dev/null || \
+		die "Adding record $2, host not found: $host";
+	fi
+    fi
+
+    sed -i "/$3,$lookup/d" $records	# Cleanup record, if any.
+    shift 2;				# Skip zone name and record type
+    echo $* | sed 's/ /,/g' >> $records	# Add record
+    update_serial $zone			# Update serial number
+
+    return 0;
+}
+
+
+## Input: {verbose flag}
+## Return: true or false if missing parameter(s)
+function check_params() {
+    local result=0;	# True
+    for p in ttl refresh retry expire ncachettl; do
+	[ -n "${!p}" ] && continue;
+	result=1;	# False
+	[ -z "$1" ] && continue;
+	warn "Parameter not defined: "$p
+    done
+    return $result;
+}
+
+## Input: Zone name {Output file}
+## Return: true
+function create_dbfile() {
+    [ -z "$1" ] && die "create_dbfile():" Missing arguments;
+    check_params || die "create_dbfile():" Missing parameters;
+
+    . $pzonedir/$1/config	# Load zone global/SOA parameters
+    . $pzonedir/$1/serial	# Read zone serial number
+
+    local output=$binddir/db.$1
+    [ -n "$2" ] && output=$2
+
+    cat >$output <<EOF
+;
+; BIND data file for $1 - DB description
+; Created by $(basename $0) on $(date -R)
+;
+\$TTL	$ttl	; ($(human $ttl))
+@	IN	SOA	$1. $admin. (
+		$(printf "%10d" $serial)	; Serial
+		$(printf "%10d" $refresh)	; Refresh ($(human $refresh))
+		$(printf "%10d" $retry)	; Retry  ($(human $retry))
+		$(printf "%10d" $expire)	; Expire ($(human $expire))
+		$(printf "%10d" $ncachettl)	; Negative Cache TTL ($(human $ncachettl))
+);
+EOF
+    for type in ${supported_records[*]}; do
+	[ -f "$pzonedir/$1/records.$type" ] || continue;
+	echo -e ";\n; Record(s)" $type >> $binddir/db.$1
+	sort $pzonedir/$1/records.$type | awk -F, \
+	    '{print $1"\tIN\t'$type'\t"$2" "$3;}' >> $binddir/db.$1
+    done
+
+    cat >>$output <<EOF
+;
+; End of file: $binddir/db.$1
+;
+EOF
+    return 0;
+}
+
+## Input: Zone name {Output file}
+## Return: true
+function create_zonefile() {
+    [ -z "$1" ] && die "create_zonefile():" Missing arguments;
+    local output=$binddir/zone.$1
+    [ -n "$2" ] && output=$2
+
+    . $pzonedir/$1/config	# Load zone global parameters
+
+    cat >$output <<EOF
+;
+; BIND data file for $1 - zone description
+; Created by $(basename $0) on $(date -R)
+;
+zone "$1" {
+	type $type;
+	file "$binddir/db.$1";
+};
+
+// No reverse resolution for $1
+EOF
+    cat >>$output <<EOF
+;
+; End of file: $binddir/zone.$1
+;
+EOF
+    return 0;
+}
+
+## Input: Zone name
+## Return: true
+function show_zone() {
+    [ -z "$1" ] && die "publish_zone():" Missing arguments;
+    check_params || die "publish_zone():" Missing parameters;
+
+    local tmpfile=$(mktemp)
+    create_zonefile $1 $tmpfile;
+    cat $tmpfile;
+    create_dbfile $1 $tmpfile;
+    cat $tmpfile;
+    rm -f $tmpfile;
+
+    return 0
+}
+
+## Input: Zone name
+## Return: true
+function publish_zone() {
+    [ -z "$1" ] && die "publish_zone():" Missing arguments;
+    check_params || die "publish_zone():" Missing parameters;
+
+    [ -f "$binddir/named.conf.local" ] || \
+	die "publish_zone(): File not found:" $binddir/named.conf.local;
+
+    create_zonefile $1;
+    create_dbfile $1;
+
+    sed -i '/include.*zone.$1/d' $binddir/named.conf.local;
+    echo 'include "'$binddir'/zone.'$1'";' >> $binddir/named.conf.local;
+
+    cat <<EOF
+Zone $1 published:
+-> $binddir/sone.$1
+-> $binddir/db.$1
+
+You still need to restart bind service:
+#> service bind9 restart
+
+EOF
+    return 0
+}
+
+##
+function pzone_batch() {
+    [ -z "$1" ] && die "pzone_batch():" Missing arguments;
+    [ -f "$1" ] || die "File not found:" $1
+    local batchfile=$(mktemp);
+    local awkfile=$(mktemp);
+    cat <<EOF >$awkfile
+/create_zone/ { print };
+/publish_zone/ { print };
+/show_zone/ { print };
+/add_record/ { print };
+/del_record/ { print };
+EOF
+    awk -f $awkfile $1 > $batchfile;
+    . $batchfile;
+    rm -f $batchfile $awkfile;
+}
+
+##
+function get_options() {
+    return 0;
+}
+
+##
+function usage() {
+    local me=$(basename $0)
+
+    cat <<EOF
+Usage: $me [<options>] <command> <zonename> [<args>]
+
+Options:
+  -h        - print this help.
+  -t        - Zone Time-To-Live value (default: $(human $ttl)).
+  -r        - Zone refresh value (default: $(human $refresh)).
+  -e        - Zone expire value (default:  $(human $expire)).
+  -n        - Negative cache TTL value (default: $(human $ncachettl)).
+
+Commands:
+  help          - Display detailed help.
+  create	- Create a new zone for configuration.
+  publish	- Publish a zone for immediate handling.
+  disable	- Unpublish a zone from bind handling.
+  show		- Display bind data file for the zone.
+  config	- Configure zone parameters (excl. records)
+  add zone	- Add a new zone for configuration (same as create).
+  add record	- Add zone record.
+  del zone	- Delete a zone.
+  del record	- Delete a zone record.
+  del records	- Delete all zone records.
+
+EOF
+##  batch FILE	- Batch mode, run commands from a script.
+	
+    [ -z "$1" ] && exit;
+
+cat <<EOF
+CREATE A ZONE:
+  create ZONENAME ADMINEMAIL [NAMESERVER]
+  add zone ZONENAME ADMINEMAIL [NAMESERVER]
+	ZONENAME   - Name of the zone to create.
+	ADMINEMAIL - Email address of technical contact.
+	NAMESERVER - Zone nameserver (optional default to ns.ZONEMAME)
+
+  The command creates a zone in the $me database
+  (cfr. $pzonedir/).
+
+PUBLISH A ZONE:
+  publish ZONENAME
+	ZONENAME   - Name of the zone to publish.
+
+  The command creates and install bind data file from $me zone
+  database. You still need to restart the bind service.
+
+DISABLE A ZONE:
+  disable ZONENAME
+	ZONENAME   - Name of the zone to disable (aka. unpublish).
+
+  The command removes bind data file for the zone. You still need to
+  restart the bind service.
+
+DISPLAY A ZONE:
+  show ZONENAME
+	ZONENAME   - Name of the zone to display.
+
+  The command creates and displays bind data file from $me zone
+  database. Files are NOT install, just displayed as it would be
+  installed by publish command.
+
+CONFIGURE A ZONE:
+  config ZONENAME NAME VALUE
+	ZONENAME   - Name of the zone to configure.
+
+  The command set or update zone configuration parameters, such as
+  ttl, ns, admin, refresh, retry, expire & n(egative)cachettl
+
+ADD RECORD TO A ZONE:
+  add record ZONENAME TYPE NAME PARAMS...
+	ZONENAME   - Name of the zone to update.
+	TYPE       - Record type (A AAAA MX TXT CNAME)
+	NAME       - Record name (eg. www, mail)
+	PARAMS     - Record paramters depending from record type
+                     MX: PARAMS=MX-Priority mailserver
+                         mailserver MUST exists (internal as
+                         A(AAA)record or external, hence resolvable)
+                     NS & CNAME: PARAMS=host
+                         host MUST exists (internal as A(AAA) record
+                         or external, hence resolvable)
+                     A(AAA): PARAMS=IP Address
+                     TXT: PARAMS=Associated TXT value
+
+DELETE A ZONE:
+  del zone ZONENAME
+	ZONENAME   - Name of the zone to delete.
+
+  The command deletes the zone from the $me database, only of the zone
+  is not published. You may need to disable the zone first.
+
+DELETE A ZONE RECORD:
+  del record ZONENAME TYPE NAME [PRIORITY]
+	ZONENAME   - Name of the zone to update.
+	TYPE       - Record type (A AAAA MX TXT CNAME)
+	NAME       - Record name (eg. www, mail)
+        PRIORITY   - MX record priority, only for MX record.
+
+  The command deletes a zone record from the $me database.
+
+DELETE ALL ZONE RECORDS:
+  del records ZONENAME [TYPE]
+	ZONENAME   - Name of the zone to update.
+	TYPE       - Record type (A AAAA MX TXT CNAME)
+
+  The command deletes all records from all or a given type, if
+  specified.
+
+EOF
+    exit;
+}
+
+
+get_options;
+
+[ "$1" == "help" ] && usage help;
+[ -z "$2" ] && usage;
+
+case $1 in 
+    hel*)
+	shift; usage $1;
+	;;
+    cre*)
+	shift; create_zone $*;
+	;;
+    pub*)
+	shift; publish_zone $*;
+	;;
+    dis*)
+	warn "Command not supported yet: $1";
+	;;
+    sho*)
+	shift; show_zone $*;
+	;;
+    con*)
+	warn "Command not supported yet: $1";
+	;;
+    add)
+	shift
+	case $1 in
+	    zone)
+		shift; create_zone $*;
+		;;
+	    rec*)
+		shift; add_record $*;
+		;;
+	    *)
+		echo Unsupported add command type: $1
+		;;
+	esac
+	;;
+    del)
+	warn "Command not supported yet: $1";
+	;;
+    bat*)
+	shift; pzone_batch $1;
+	;;
+    *)
+	echo Unsupported command: $1
+	;;
+esac
+exit
 
 ## Main --
 #update_serial example.net
@@ -163,6 +562,12 @@ function add_record_mx() {
 #create_zone example.net dns.example.net
 #create_zone test.edu dns.test.org
 add_record example.net A www 10.168.45.67
-add_record_mx example.net mx 50 mx.example.net
-add_record_mx example.net mx 20 mx.yobi.be
+add_record example.net A mx 10.168.45.67
+add_record example.net MX mx 50 mx.example.net
+add_record example.net MX mx 20 mx.yobi.be
+add_record example.net CNAME mail mail.yobi.be
 #add_record test.edu MX @ 10 10.23.45.67
+#show_zone example.net
+publish_zone example.net
+
+usage;
