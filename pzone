@@ -4,24 +4,33 @@
 #
 # Note: 'Propre' stands for Own in french.
 #
-force=1
-binddir=./etc/bind
-pzonedir=zones
+# References:
+# 1. http://www.thegeekstuff.com/2014/01/install-dns-server/
+# 2. http://www.aboutdebian.com/dns.htm
+#
+
+# Do not change variables here, see /etc/default/pzone
+force=false
+ifname=eth0
+me=$(basename $0)
 
 ## List of supported records
-declare -a supported_records=(A MX NS CNAME TXT)
+declare -a supported_records=(NS A MX CNAME TXT)
 #declare -a supported_functions=(create_zone add_record publish_zone)
 
-## Load defauls
+## Load defautls
 [ -f "/etc/default/pzone" ] && . /etc/default/pzone
-[ -f "./pzone.defaults" ] && . ./pzone.defaults
+
+## Load user config
+for conf in ~/.$me.conf ./$me.conf; do
+    [ -f $conf ] && . $conf
+done
 
 ## Input: warning message
 ## Output: none
 ## Return: true
 function warn() {
     local message=$*
-    local me=$(basename $0)
     echo -e "[$me]" ${message/\\n/\\n[$me] };
     return 0;
 }
@@ -31,7 +40,6 @@ function warn() {
 ## Return: true
 function verbose() {
     local message=$*
-    local me=$(basename $0)
     echo -e "[$me]" ${message/\\n/\\n[$me] };
     return 0;
 }
@@ -71,40 +79,13 @@ function human() {
     return 0;
 }
 
-## Input: Zone name, Zone admin email {Zone nameserver}
-## Output: none
-## Return: true
-function create_zone() {
-    local admin=$2
-    local nameserver=$3
-    [ -z "$2" ] && die "create_zone():" Missing arguments;
-    [ -f "$binddir/db.$1" ] && die Zone already exist: $binddir/db.$1;
-    [ -d "$pzonedir/$1" ] && die  Zone already exist: $pzonedir/$1;
-    [ -z "$3" ] && nameserver=ns.$1
-    mkdir -p $pzonedir/$1
-    cat >$pzonedir/$1/config <<EOF
-type=master
-ns=$nameserver
-admin=${admin/@/.}
-ttl=$ttl
-refresh=$refresh
-retry=$retry
-expire=$expire
-ncachettl=$ncachettl
-EOF
-    echo "serial="$(date +%Y%m%d01) > $pzonedir/$1/serial
-
-    verbose Zone $1 created.
-
-    return 0;
-}
-
 ## Input: Zone name
 ## Output: none
 ## Return: true or false is not present
 function check_zone() {
     [ -z "$1" ] && die "check_zone():" Missing zone name;
-    [ -d "$pzonedir/$1" ] && return 0; # True
+    [ -d "$pzonedir/$1" ] && \
+	[ -f "$pzonedir/$1/config" ] && return 0; # True
     return 1; # False
 }
 
@@ -126,6 +107,7 @@ function check_record() {
     [ -z "$3" ] && die "check_zone():" Missing arguments;
     check_rectype $2 || die "check_record():" Unsupported record type: $2;
     check_zone $1 || die "check_record():" Zone not found: $1;
+    [ -f "$pzonedir/$1/records.$2" ] || return 1; # False - no $2 records.
     local lookup="^$3,"
     [ -n "$4" ] && lookup="^$3,$4,";
     grep -qP $lookup $pzonedir/$1/records.$2 && return 0; # True
@@ -158,46 +140,68 @@ function add_record() {
     [ "$2" == "MX" ] && [ -z "$5" ] && die "add_record():" Missing arguments;
 
     local zone=$1
-    check_zone $zone || die "add_record():" Zone not found: $zone;
+    local type=$2
+    local name=$3
+    local parm=$4
+    local prio=
+    local errstr=
+    local lookup=
 
-    local records=$pzonedir/$zone/records.$2
+    check_zone $zone || die "add_record():" Zone not found: $zone;
+    check_rectype $type || die "add_record():" Unsupported record type: $type
+
+    local records=$pzonedir/$zone/records.$type
     [ -f "$records" ] || touch $records;
 
-    # Special for MX record, handle one extra parameter
-    local priority=
-    local priority_errstr=
-    local lookup=
-    [ "$2" == "MX" ] && \
-	lookup="$4," && \
-	priority=$4 && \
-	priority_errstr=", priority= $4"
+    [ "$type" == "MX" ] && \
+	prio=$4 && \
+	parm=$5 && \
+	lookup=",$4" && \
+	errstr=", priority= $4";	# Update for MX record
 
-    check_record $zone $2 $3 $priority && [ ! $force ] && \
-	die "add_record():" Record $2 already exist: $3$priority_errstr;
+    check_record $zone $type $name $prio && [ $force = false ] && \
+	die "add_record():" Record $type already exist: $name$errstr;
 
     # Check assigned mail or name server, must exist local or external.
-    if [ "$2" == "MX" ] || [ "$2" == "NS" ] || [ "$2" == "CNAME" ]; then
-	local host=$4
-	[ "$2" == "MX" ] && host=$5
+    if [ "$type" == "MX" ] || [ "$type" == "NS" ] || [ "$type" == "CNAME" ];
+    then
+	local required=
 
-	if echo $host | grep -qP "$zone$"; then
-	    check_record $zone A ${host/.$zone/} || \
-		die "Adding record $2, record A not found: "${host/.$zone/} \
+	# Part of my zone - full qualified
+	if echo $parm | grep -qP "$zone$"; then
+	    required=${parm/.$zone/};
+	    parm=$parm.
+
+	# Part of my zone - short name
+	elif echo $parm | grep -qv '\.'; then
+	    required=$parm;
+	fi
+
+	if [ -n "$required" ]; then
+	    local found=$force
+	    for item in A CNAME; do
+		check_record $zone $item $required && found=true
+	    done
+	    $found || \
+		die "Adding record $type, record A|CNAME not found: "$required \
 		    "\nPlease define first!"
-	else
-	    host $host >/dev/null || \
-		die "Adding record $2, host not found: $host";
+
+	else	# External host
+	    $force || host $parm >/dev/null || \
+		die "Adding record $type, host not found: $parm";
+	    parm=$parm.
 	fi
     fi
 
     sed -i "/$3,$lookup/d" $records	# Cleanup record, if any.
-    shift 2;				# Skip zone name and record type
-    echo $* | sed 's/ /,/g' >> $records	# Add record
+    echo $name $prio $parm | \
+	sed 's/ /,/g' >> $records	# Add record
     update_serial $zone			# Update serial number
+
+    verbose Record $name $type $parm added.
 
     return 0;
 }
-
 
 ## Input: {verbose flag}
 ## Return: true or false if missing parameter(s)
@@ -227,22 +231,23 @@ function create_dbfile() {
     cat >$output <<EOF
 ;
 ; BIND data file for $1 - DB description
-; Created by $(basename $0) on $(date -R)
+; Created by $me on $(date -R)
 ;
 \$TTL	$ttl	; ($(human $ttl))
-@	IN	SOA	$1. $admin. (
-		$(printf "%10d" $serial)	; Serial
-		$(printf "%10d" $refresh)	; Refresh ($(human $refresh))
-		$(printf "%10d" $retry)	; Retry  ($(human $retry))
-		$(printf "%10d" $expire)	; Expire ($(human $expire))
-		$(printf "%10d" $ncachettl)	; Negative Cache TTL ($(human $ncachettl))
+@	IN	SOA	$ns. $admin. (
+		$(printf "%10d ; Serial" $serial)
+		$(printf "%10d ; Refresh (%s)" $refresh $(human $refresh))
+		$(printf "%10d ; Retry (%s)" $retry $(human $retry))
+		$(printf "%10d ; Expire (%s)" $expire $(human $expire))
+		$(printf "%10d ; Negative Cache TTL (%s)" $ncachettl $(human $ncachettl))
 );
 EOF
+
     for type in ${supported_records[*]}; do
 	[ -f "$pzonedir/$1/records.$type" ] || continue;
-	echo -e ";\n; Record(s)" $type >> $binddir/db.$1
+	echo -e ";\n; Record(s)" $type >> $output
 	sort $pzonedir/$1/records.$type | awk -F, \
-	    '{print $1"\tIN\t'$type'\t"$2" "$3;}' >> $binddir/db.$1
+	    '{print $1"\tIN\t'$type'\t"$2" "$3;}' >> $output
     done
 
     cat >>$output <<EOF
@@ -265,7 +270,7 @@ function create_zonefile() {
     cat >$output <<EOF
 ;
 ; BIND data file for $1 - zone description
-; Created by $(basename $0) on $(date -R)
+; Created by $me on $(date -R)
 ;
 zone "$1" {
 	type $type;
@@ -279,14 +284,93 @@ EOF
 ; End of file: $binddir/zone.$1
 ;
 EOF
+
+    return 0;
+}
+
+## Input: Zone name
+## Return: true
+function disable_zone() {
+    [ -z "$1" ] && die "disable_zone():" Missing arguments;
+
+    [ -f "$binddir/named.conf.local" ] || \
+	die "disable_zone(): File not found:" $binddir/named.conf.local;
+
+    sed -i '/include.*zone.$1/d' $binddir/named.conf.local;
+
+    ## Delete 'backups'
+    [ -f "$binddir/db.$1.disabled" ]	&& rm -f $binddir/db.$1.disabled;
+    [ -f "$binddir/zone.$1.disabled" ]	&& rm -f $binddir/zone.$1.disabled;
+
+    ## Create 'backups'
+    mv $binddir/db.$1	$binddir/db.$1.disabled
+    mv $binddir/zone.$1 $binddir/zone.$1.disabled
+
+    cat <<EOF
+Zone $1 disabled.
+
+You still need to restart bind service:
+#> service bind9 restart
+EOF
+
+    return 0
+}
+
+## Input: Zone name
+## Output: none
+## Return: true
+function delete_zone() {
+    [ -z "$1" ] && die "delete_zone():" Missing arguments;
+    [ -f "$binddir/db.$1" ] || [ -f "$binddir/zone.$1" ] \
+	&& die Zone activated: $binddir/zone.$1 "\nPlease disable zone first";
+
+    ## Delete 'backups'
+    [ -d "$pzonedir/$1.deleted" ] && rm -rf $pzonedir/$1.deleted;
+
+    ## Create 'backups'
+    mv $pzonedir/$1	$pzonedir/$1.deleted;
+
+    return 0;
+}
+
+## Input: Zone name, Zone admin email {Zone nameserver}
+## Output: none
+## Return: true
+function create_zone() {
+    local admin=$2
+    local nameserver=$3
+    [ -z "$2" ] && die "create_zone():" Missing arguments;
+    [ -f "$binddir/db.$1" ] && die Zone already exist: $binddir/db.$1;
+    [ -d "$pzonedir/$1" ] && die  Zone already exist: $pzonedir/$1;
+    [ -z "$3" ] && nameserver=ns.$1
+    mkdir -p $pzonedir/$1
+    cat >$pzonedir/$1/config <<EOF
+type=master
+ns=$nameserver
+admin=${admin/@/.}
+ttl=$ttl
+refresh=$refresh
+retry=$retry
+expire=$expire
+ncachettl=$ncachettl
+EOF
+    echo "serial="$(date +%Y%m%d01) > $pzonedir/$1/serial
+
+    # Add NS record
+    add_record $1 A ns $ipaddr
+    add_record $1 NS @ $nameserver
+
+    verbose Zone $1 created.
+
     return 0;
 }
 
 ## Input: Zone name
 ## Return: true
 function show_zone() {
-    [ -z "$1" ] && die "publish_zone():" Missing arguments;
-    check_params || die "publish_zone():" Missing parameters;
+    [ -z "$1" ] && die "show_zone():" Missing arguments;
+    check_params || die "show_zone():" Missing parameters;
+    check_zone $1 || die "show_zone():" Zone not found: $1;
 
     local tmpfile=$(mktemp)
     create_zonefile $1 $tmpfile;
@@ -325,6 +409,17 @@ EOF
     return 0
 }
 
+# Input: interface name {, IP family (-4|-6)}
+# Output: IP address
+function getip() {
+    ip $2 addr show dev $1 2>/dev/null | \
+	grep "scope global" | \
+	grep -v "temporary" | \
+	head -1 | \
+	awk '{ print $2; }' | \
+	cut -d '/' -f 1
+}
+
 ## Input: batch file
 ## Output: none
 ## Return: true
@@ -350,8 +445,6 @@ EOF
 ## Output: none
 ## Return: Does not returm, exit 1.
 function usage() {
-    local me=$(basename $0)
-
     cat <<EOF
 Usage: $me [<options>] <command> <zonename> [<args>]
 
@@ -361,6 +454,7 @@ Options:
   -r REFRESH    - Zone refresh value (default: $(human $refresh)).
   -e EXPIRE     - Zone expire value (default:  $(human $expire)).
   -n NCACHETTL  - Negative cache TTL value (default: $(human $ncachettl)).
+  -f            - Force operation.
 
 Commands:
   help          - Display detailed help.
@@ -463,7 +557,11 @@ EOF
     exit;
 }
 
-while getopts "ht:r:e:n:" OPTION; do
+## Get (default) IP address
+[ -z "$ipaddr" ] && [ -n "$ifname" ] && ipaddr=$(getip $ifname)
+
+# Command line options...
+while getopts "hft:r:e:n:i:a:" OPTION; do
     case "$OPTION" in
 	t)	ttl=$OPTARG;
 	    ;;
@@ -472,6 +570,12 @@ while getopts "ht:r:e:n:" OPTION; do
 	e)	expire=$OPTARG;
 	    ;;
 	n)	ncachettl=$OPTARG;
+	    ;;
+	f)	force=true;
+	    ;;
+	i)	ipaddr=$(getip $OPTARG);
+	    ;;
+	a)	ipaddr=$OPTARG;
 	    ;;
 	h)	usage; 
 	    ;;
@@ -497,8 +601,7 @@ case $1 in
 	shift; publish_zone $*;
 	;;
     dis*)
-	warn "Command not supported yet: $1";
-	exit 1;
+	shift; disable_zone $*;
 	;;
     sho*)
 	shift; show_zone $*;
@@ -522,9 +625,17 @@ case $1 in
 		;;
 	esac
 	;;
-    del)
-	warn "Command not supported yet: $1";
-	exit 1;
+    del*)
+	shift;
+	case $1 in
+	    zone)
+		shift; delete_zone $*;
+		;;
+	    *)
+		warn Unsupported del command type: $1
+		exit 1;
+		;;
+	esac
 	;;
     bat*)
 	shift; pzone_batch $1;

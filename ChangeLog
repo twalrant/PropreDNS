@@ -1,0 +1,7 @@
+2014-06-09  twalrant  <changelog.tgc@walrant.net>
+
+	* pzone (me): add ifname, user defined configs, add NS record
+	while creating new zone, refactor add_record(), support for
+	disable_zone() & delete_zone(), add command line options -f, -i,
+ 	-a and command to delete zone.
+

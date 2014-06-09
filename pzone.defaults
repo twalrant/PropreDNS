@@ -1,0 +1,29 @@
+## Defaults values for PropreDNS
+## See also https://wiki.debian.org/Bind9
+
+## Bind directory - placeholder for bind data files.
+binddir=/etc/bind
+
+## PropreDNS database folder - placeholder for PropreDNS data files.
+pzonedir=/var/local/cache/pzone
+
+## Zone Time-To-Live - expresses the duration (in seconds) validity,
+## by default, of the information contained in the resource
+## record. Once this time expires, it is necessary to recheck the
+   ## data.
+ttl=3600 # 1h
+
+## Refresh defines the data refresh period.
+refresh=3600 # 1h
+
+## Retry value - if an error occurs during the last refresh, it will
+## be repeated at the end of this time expressed in secs.
+retry=600	# 10m
+
+## Expire value - the server is considered unavailable after this time
+## expressed in secs.
+expire=86400	# 1day
+
+## Negative cache TTL': set the lifetime of a NXDOMAIN response from
+## us - expressed in secs.
+ncachettl=600	# 1h
