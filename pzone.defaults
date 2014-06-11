@@ -5,7 +5,7 @@
 binddir=/etc/bind
 
 ## PropreDNS database folder - placeholder for PropreDNS data files.
-pzonedir=/var/local/cache/pzone
+pzonedir=/var/local/pzone
 
 ## Zone Time-To-Live - expresses the duration (in seconds) validity,
 ## by default, of the information contained in the resource
